@@ -1,0 +1,67 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      FRAUD_THRESHOLD: "0.5"
+      POSTGRES_URL: "postgresql://fmcc:fmcc@postgres:5432/fmcc"
+    volumes:
+      - ./models:/app/models:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fmcc
+      POSTGRES_USER: fmcc
+      POSTGRES_PASSWORD: fmcc
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fmcc"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mlflow:
+    image: python:3.11-slim
+    command: >
+      sh -c "pip install mlflow psycopg2-binary -q &&
+             mlflow server
+               --backend-store-uri postgresql://fmcc:fmcc@postgres:5432/fmcc_mlflow
+               --default-artifact-root s3://fmcc-artifacts/mlflow
+               --host 0.0.0.0 --port 5000"
+    ports:
+      - "5000:5000"
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      POSTGRES_URL: "postgresql://fmcc:fmcc@postgres:5432/fmcc"
+      API_URL: "http://api:8000"
+    depends_on:
+      - api
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
