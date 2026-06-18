@@ -3,19 +3,31 @@ from typing import Optional
 
 
 class CDRRecord(BaseModel):
-    """Single CDR record for real-time feature computation."""
+    """
+    Pre-aggregated 1-day stats for a single MSISDN.
+    The caller computes these from raw CDRs (after call stitching).
+    """
     msisdn: int = Field(..., description="Subscriber number")
-    date: str = Field(..., description="Date of activity (YYYY-MM-DD)")
-    outgoing_duration: float = Field(0.0, ge=0)
-    incoming_duration: float = Field(0.0, ge=0)
-    unique_recipients: int = Field(0, ge=0)
-    total_calls: int = Field(0, ge=0)
-    unique_cell_ids: int = Field(0, ge=0)
-    imei_count: int = Field(0, ge=0)
-    short_call_count: int = Field(0, ge=0, description="Calls <= 15s")
-    night_call_ratio: float = Field(0.0, ge=0.0, le=1.0, description="Fraction of calls 22:00-06:00")
-    call_burst_ratio: float = Field(0.0, ge=0.0, description="Max calls in any 1-hour window / total calls")
-    avg_call_gap_seconds: float = Field(0.0, ge=0)
+    date: str = Field(..., description="Activity date (YYYY-MM-DD)")
+
+    # Outgoing (Cell 37)
+    outgoing_duration: float = Field(0.0, ge=0, description="Total outgoing call seconds")
+    avg_call_duration: float = Field(0.0, ge=0, description="Mean outgoing call duration (s)")
+    total_calls: int = Field(0, ge=0, description="Outgoing call count")
+    max_call_duration: float = Field(0.0, ge=0, description="Longest single outgoing call (s)")
+    unique_recipients: int = Field(0, ge=0, description="Distinct numbers called")
+    unique_cell_ids: int = Field(0, ge=0, description="Distinct cell towers used")
+    imei_count: int = Field(0, ge=0, description="Distinct IMEIs observed")
+    short_call_count: int = Field(0, ge=0, description="Calls <= 15 seconds")
+    active_hours: int = Field(1, ge=1, description="Number of distinct hours with activity")
+
+    # Received within dataset (Cell 37) — calls where this MSISDN is the CALLEDMSISDN
+    received_duration: float = Field(0.0, ge=0, description="Total received call seconds (within dataset)")
+    received_calls: int = Field(0, ge=0, description="Received call count (within dataset)")
+
+    # Cell 48 — high_activity_flag must be pre-computed by the caller
+    # (requires population-level quantiles, so can't compute per-record)
+    high_activity_flag: int = Field(0, ge=0, le=1)
 
 
 class PredictionRequest(BaseModel):

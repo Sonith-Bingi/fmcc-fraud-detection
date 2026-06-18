@@ -1,5 +1,5 @@
 """
-Training script — mirrors the FMCC_1Day.ipynb pipeline end-to-end.
+Training script — mirrors FMCC_1Day_Corrected.ipynb pipeline end-to-end.
 Reads raw CDR CSVs, engineers 1-day features, trains Voting Ensemble,
 saves artifact to models/<version>.pkl.
 
@@ -14,7 +14,7 @@ Usage:
 import argparse
 import json
 import logging
-import os
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -30,14 +30,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
+    precision_recall_curve,
     precision_score,
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.preprocessing import StandardScaler
 
-# Allow running from repo root
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.features import FEATURE_COLS, build_1day_features
@@ -69,12 +67,28 @@ def load_cdrs(bihar_path: str, rajasthan_path: str) -> pd.DataFrame:
     return data
 
 
-def load_suspects(bihar_path: str, rajasthan_path: str) -> pd.Series:
+def load_suspects(bihar_path: str, rajasthan_path: str) -> pd.DataFrame:
+    """Return full suspect DataFrame — we need both MSISDN and REPORTDATE."""
     s1 = pd.read_csv(bihar_path)
     s2 = pd.read_csv(rajasthan_path)
     suspects = pd.concat([s1, s2], ignore_index=True)
-    logger.info("Suspect MSISDNs: %d", len(suspects))
-    return suspects["MSISDN"]
+    suspects["REPORTDATE"] = pd.to_datetime(suspects["REPORTDATE"], format="mixed").dt.date
+    logger.info("Suspect records: %d", len(suspects))
+    return suspects
+
+
+def label_features(features: pd.DataFrame, suspects: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cell 37 (corrected): label on (MSISDN, DATE) pair, not MSISDN alone.
+    Only the specific date a MSISDN was flagged becomes isFraud=1.
+    This prevents label smearing across all days of a suspect's activity.
+    """
+    suspect_pairs = set(zip(suspects["MSISDN"], suspects["REPORTDATE"]))
+    features["isFraud"] = features.apply(
+        lambda row: 1 if (row["MSISDN"], row["DATE"]) in suspect_pairs else 0,
+        axis=1,
+    )
+    return features
 
 
 def train(args):
@@ -85,8 +99,9 @@ def train(args):
     # ── Feature engineering ───────────────────────────────────────────────────
     logger.info("Building 1-day features...")
     features = build_1day_features(data)
-    suspects = suspects.astype(features["MSISDN"].dtype)
-    features["isFraud"] = features["MSISDN"].isin(suspects).astype(int)
+
+    # ── Labeling: (MSISDN, DATE) pair match — corrected notebook approach ─────
+    features = label_features(features, suspects)
     logger.info(
         "Feature matrix: %d rows | Fraud: %d (%.2f%%)",
         len(features),
@@ -94,41 +109,43 @@ def train(args):
         features["isFraud"].mean() * 100,
     )
 
-    # ── Train / test split (group by MSISDN — no leakage) ────────────────────
+    # ── Out-of-time train/test split (Cell 38 corrected) ─────────────────────
+    # Sort dates, use earliest 70% for train and latest 30% for test.
+    # Prevents temporal leakage: model never sees future dates during training.
     X = features[FEATURE_COLS]
     y = features["isFraud"]
-    groups = features["MSISDN"]
 
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, test_idx = next(gss.split(X, y, groups))
-    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    all_dates = sorted(features["DATE"].unique())
+    split_point = int(len(all_dates) * 0.7)
+    train_dates = set(all_dates[:split_point])
+    test_dates = set(all_dates[split_point:])
+
+    train_mask = features["DATE"].isin(train_dates)
+    test_mask = features["DATE"].isin(test_dates)
+
+    X_train, X_test = X[train_mask], X[test_mask]
+    y_train, y_test = y[train_mask], y[test_mask]
     logger.info(
-        "Train: %d rows (%d fraud) | Test: %d rows (%d fraud)",
-        len(X_train), y_train.sum(), len(X_test), y_test.sum(),
+        "Out-of-time split: train dates %s→%s (%d rows, %d fraud) | test dates %s→%s (%d rows, %d fraud)",
+        min(train_dates), max(train_dates), len(X_train), int(y_train.sum()),
+        min(test_dates),  max(test_dates),  len(X_test),  int(y_test.sum()),
     )
 
-    # ── Model: Voting Ensemble ─────────────────────────────────────────────────
-    scaler = StandardScaler()
-    X_train_sc = scaler.fit_transform(X_train)
-    X_test_sc = scaler.transform(X_test)
-
-    rf = RandomForestClassifier(n_estimators=200, max_depth=20, class_weight="balanced", random_state=42, n_jobs=-1)
-    gb = GradientBoostingClassifier(n_estimators=100, max_depth=5, random_state=42)
-    lr = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42)
-
-    # VotingClassifier needs all estimators to see the same X; LR needs scaled
-    # We wrap LR with a pipeline so VotingClassifier stays homogeneous
-    from sklearn.pipeline import Pipeline
-    lr_pipe = Pipeline([("scaler", StandardScaler()), ("lr", lr)])
+    # ── Model: Voting Ensemble — matches Cell 45 exactly ──────────────────────
+    # Notebook feeds raw (unscaled) features to all three estimators
+    rf = RandomForestClassifier(n_estimators=100, random_state=42, class_weight="balanced")
+    gb = GradientBoostingClassifier(n_estimators=100, random_state=42)
+    lr = LogisticRegression(max_iter=1000, random_state=42, class_weight="balanced")
 
     model = VotingClassifier(
-        estimators=[("rf", rf), ("gb", gb), ("lr", lr_pipe)],
+        estimators=[("rf", rf), ("gb", gb), ("lr", lr)],
         voting="soft",
-        n_jobs=-1,
     )
     logger.info("Training Voting Ensemble (RF + GBM + LR)...")
-    model.fit(X_train, y_train)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model.fit(X_train, y_train)
 
     # ── Evaluation ────────────────────────────────────────────────────────────
     y_proba = model.predict_proba(X_test)[:, 1]
@@ -144,7 +161,6 @@ def train(args):
     logger.info("Metrics: %s", metrics)
 
     # ── Find optimal threshold ────────────────────────────────────────────────
-    from sklearn.metrics import precision_recall_curve
     precisions, recalls, thresholds = precision_recall_curve(y_test, y_proba)
     f1s = 2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-10)
     best_threshold = float(thresholds[np.argmax(f1s)])

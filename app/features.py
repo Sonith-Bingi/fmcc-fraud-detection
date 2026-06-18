@@ -1,132 +1,208 @@
 """
-1-day feature engineering — mirrors the notebook logic.
-Accepts raw CDR DataFrame, returns aggregated per-MSISDN-DATE feature DataFrame.
+1-day feature engineering — exact replication of FMCC_1Day_Corrected.ipynb.
+
+Pipeline:
+  1. Call stitching  (Cell 13): merge consecutive same-pair calls
+  2. Aggregation     (Cell 37): per-MSISDN-DATE outgoing + received
+  3. Derived ratios  (Cell 37): recipient_uniqueness_ratio, short_call_percent, etc.
+  4. Advanced feats  (Cell 48): call_to_unique_ratio, duration_to_calls_ratio, etc.
+
+Column naming follows the corrected notebook exactly:
+  - received_duration_within_dataset_1day  (NOT incoming_duration)
+  - received_calls_within_dataset_1day     (NOT incoming_calls)
+  - received_duration_percent_within_dataset
+  - received_calls_percent_within_dataset
+  - received_outgoing_interaction          (NOT incoming_outgoing_interaction)
 """
 import pandas as pd
 import numpy as np
 
-
+# Exact feature columns matching FMCC_1Day_Corrected.ipynb (Cells 37 + 48)
 FEATURE_COLS = [
+    # --- Cell 37 outgoing base features ---
     "outgoing_duration_1day",
-    "incoming_duration_1day",
-    "outgoing_pct_1day",
+    "avg_call_duration_1day",
+    "call_count_1day",
+    "max_call_duration_1day",
     "unique_recipients_1day",
-    "total_calls_1day",
-    "unique_cell_ids_1day",
-    "imei_count_1day",
-    "short_call_count_1day",
-    "short_call_ratio_1day",
-    "night_call_ratio_1day",
-    "call_burst_ratio_1day",
-    "avg_call_gap_seconds_1day",
+    "cell_diversity_1day",
+    "device_diversity_1day",
+    "short_calls_1day",
+    "active_hours_1day",
+    # --- Cell 37 derived ratios ---
+    "recipient_uniqueness_ratio",
+    "short_call_percent",
+    "calls_per_active_hour",
+    # --- Cell 37 received (incoming within dataset) ---
+    "received_duration_within_dataset_1day",
+    "received_calls_within_dataset_1day",
+    "received_duration_percent_within_dataset",
+    "received_calls_percent_within_dataset",
+    # --- Cell 48 interaction features ---
     "call_to_unique_ratio",
-    "duration_per_call",
-    "cell_id_density",
+    "duration_to_calls_ratio",
+    "cell_diversity",
+    "received_outgoing_interaction",
+    "high_activity_flag",
 ]
 
 
-def build_1day_features(data: pd.DataFrame) -> pd.DataFrame:
+def stitch_calls(data: pd.DataFrame) -> pd.DataFrame:
     """
-    Input:  raw CDR DataFrame with columns from the notebook.
-    Output: per-(MSISDN, DATE) feature DataFrame ready for model input.
+    Cell 13: merge consecutive calls between the same MSISDN pair.
+    Groups back-to-back calls (where next call starts exactly when previous ends)
+    into a single stitched record with summed DURATION.
     """
     df = data.copy()
     df["DATETIMEOFCALL"] = pd.to_datetime(df["DATETIMEOFCALL"], format="mixed")
     df["DATE"] = df["DATETIMEOFCALL"].dt.date
-    df["is_short_call"] = (df["DURATION"] <= 15).astype(int)
-    df["hour"] = df["DATETIMEOFCALL"].dt.hour
-    df["is_night"] = df["hour"].isin(list(range(22, 24)) + list(range(0, 6))).astype(int)
 
-    # Sort for gap calculation
-    df = df.sort_values(["CALLINGMSISDN", "DATETIMEOFCALL"])
-    df["call_gap_seconds"] = (
-        df.groupby("CALLINGMSISDN")["DATETIMEOFCALL"]
-        .diff()
-        .dt.total_seconds()
-        .fillna(0)
+    df = df.sort_values(["CALLINGMSISDN", "CALLEDMSISDN", "DATETIMEOFCALL"])
+
+    df["expected_next_start"] = df["DATETIMEOFCALL"] + pd.to_timedelta(df["DURATION"], unit="s")
+    df["prev_expected_end"] = df.groupby(["CALLINGMSISDN", "CALLEDMSISDN"])["expected_next_start"].shift()
+    df["new_group"] = (df["DATETIMEOFCALL"] != df["prev_expected_end"]).astype(int)
+    df["group_id"] = df.groupby(["CALLINGMSISDN", "CALLEDMSISDN", "DATE"])["new_group"].cumsum()
+
+    merged = (
+        df.groupby(["CALLINGMSISDN", "CALLEDMSISDN", "DATE", "group_id"])
+        .agg(
+            DATETIMEOFCALL=("DATETIMEOFCALL", "first"),
+            DURATION=("DURATION", "sum"),
+            GLOBALCELLID=("GLOBALCELLID", "first"),
+            IMEI=("IMEI", "first"),
+            CALLINGPARTYIMSI=("CALLINGPARTYIMSI", "first"),
+        )
+        .reset_index()
     )
+    return merged
 
-    # --- Outgoing aggregations ---
-    out = df.groupby(["CALLINGMSISDN", "DATE"]).agg(
-        outgoing_duration_1day=("DURATION", "sum"),
-        total_calls_1day=("CALLEDMSISDN", "count"),
-        unique_recipients_1day=("CALLEDMSISDN", "nunique"),
-        unique_cell_ids_1day=("GLOBALCELLID", "nunique"),
-        short_call_count_1day=("is_short_call", "sum"),
-        night_call_ratio_1day=("is_night", "mean"),
-        avg_call_gap_seconds_1day=("call_gap_seconds", "mean"),
-    ).reset_index().rename(columns={"CALLINGMSISDN": "MSISDN"})
 
-    # --- Incoming aggregations ---
-    inc = df.groupby(["CALLEDMSISDN", "DATE"]).agg(
-        incoming_duration_1day=("DURATION", "sum"),
-        imei_count_1day=("IMEI", "nunique"),
-    ).reset_index().rename(columns={"CALLEDMSISDN": "MSISDN"})
+def build_1day_features(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Full feature pipeline matching FMCC_1Day_Corrected.ipynb end-to-end.
+    Input:  raw CDR DataFrame.
+    Output: per-(MSISDN, DATE) feature DataFrame with all 21 FEATURE_COLS.
+    """
+    # Step 1: Call stitching (Cell 13)
+    df = stitch_calls(data)
+    df["is_short_call"] = (df["DURATION"] <= 15).astype(int)
+    df["hour_of_day"] = df["DATETIMEOFCALL"].dt.hour
 
-    # --- Burst ratio: max calls in any 1-hour bucket / total ---
-    def burst_ratio(sub_df):
-        if len(sub_df) == 0:
-            return 0.0
-        counts = sub_df.groupby(sub_df["DATETIMEOFCALL"].dt.hour).size()
-        return counts.max() / len(sub_df)
-
-    burst = (
+    # Step 2: Outgoing aggregations per MSISDN-DATE (Cell 37)
+    outgoing = (
         df.groupby(["CALLINGMSISDN", "DATE"])
-        .apply(burst_ratio)
-        .reset_index(name="call_burst_ratio_1day")
+        .agg(
+            outgoing_duration_1day=("DURATION", "sum"),
+            avg_call_duration_1day=("DURATION", "mean"),
+            call_count_1day=("DURATION", "count"),
+            max_call_duration_1day=("DURATION", "max"),
+            unique_recipients_1day=("CALLEDMSISDN", "nunique"),
+            cell_diversity_1day=("GLOBALCELLID", "nunique"),
+            device_diversity_1day=("IMEI", "nunique"),
+            short_calls_1day=("is_short_call", "sum"),
+            active_hours_1day=("hour_of_day", "nunique"),
+        )
+        .reset_index()
         .rename(columns={"CALLINGMSISDN": "MSISDN"})
     )
 
-    # --- Merge ---
-    features = out.merge(inc, on=["MSISDN", "DATE"], how="outer").fillna(0)
-    features = features.merge(burst, on=["MSISDN", "DATE"], how="left").fillna(0)
+    # Step 3: Derived ratios (Cell 37)
+    outgoing["recipient_uniqueness_ratio"] = (
+        outgoing["unique_recipients_1day"] / (outgoing["call_count_1day"] + 1e-5)
+    )
+    outgoing["short_call_percent"] = (
+        outgoing["short_calls_1day"] / (outgoing["call_count_1day"] + 1e-5)
+    ) * 100
+    outgoing["calls_per_active_hour"] = (
+        outgoing["call_count_1day"] / (outgoing["active_hours_1day"] + 1e-5)
+    )
 
-    total_dur = features["outgoing_duration_1day"] + features["incoming_duration_1day"]
-    features["outgoing_pct_1day"] = np.where(
-        total_dur > 0, features["outgoing_duration_1day"] / total_dur * 100, 0
+    # Step 4: Received calls within dataset (Cell 37) — named exactly as notebook
+    received = (
+        df.groupby(["CALLEDMSISDN", "DATE"])["DURATION"]
+        .agg(["sum", "count"])
+        .reset_index()
+        .rename(columns={
+            "CALLEDMSISDN": "MSISDN",
+            "sum": "received_duration_within_dataset_1day",
+            "count": "received_calls_within_dataset_1day",
+        })
     )
-    features["short_call_ratio_1day"] = np.where(
-        features["total_calls_1day"] > 0,
-        features["short_call_count_1day"] / features["total_calls_1day"],
+
+    features = outgoing.merge(received, on=["MSISDN", "DATE"], how="left").fillna(0)
+
+    # Step 5: Received vs outgoing imbalance ratios (Cell 37)
+    total_dur = features["outgoing_duration_1day"] + features["received_duration_within_dataset_1day"]
+    total_calls = features["call_count_1day"] + features["received_calls_within_dataset_1day"]
+
+    features["received_duration_percent_within_dataset"] = np.where(
+        total_dur > 0,
+        (features["received_duration_within_dataset_1day"] / total_dur) * 100,
         0,
     )
+    features["received_calls_percent_within_dataset"] = np.where(
+        total_calls > 0,
+        (features["received_calls_within_dataset_1day"] / total_calls) * 100,
+        0,
+    )
+
+    # Step 6: Advanced interaction features (Cell 48)
     features["call_to_unique_ratio"] = (
-        features["total_calls_1day"] / (features["unique_recipients_1day"] + 1)
+        features["call_count_1day"] / (features["unique_recipients_1day"] + 1)
     )
-    features["duration_per_call"] = np.where(
-        features["total_calls_1day"] > 0,
-        total_dur / features["total_calls_1day"],
-        0,
+    features["duration_to_calls_ratio"] = (
+        (features["outgoing_duration_1day"] + features["received_duration_within_dataset_1day"])
+        / (features["call_count_1day"] + 1)
     )
-    features["cell_id_density"] = (
-        features["unique_cell_ids_1day"] / (features["total_calls_1day"] + 1)
+    features["cell_diversity"] = (
+        features["cell_diversity_1day"] / (features["call_count_1day"] + 1)
     )
+    features["received_outgoing_interaction"] = (
+        features["received_duration_within_dataset_1day"] * features["outgoing_duration_1day"]
+    )
+    features["high_activity_flag"] = (
+        (features["call_count_1day"] > features["call_count_1day"].quantile(0.75)) &
+        (features["outgoing_duration_1day"] > features["outgoing_duration_1day"].quantile(0.75))
+    ).astype(int)
 
     return features[["MSISDN", "DATE"] + FEATURE_COLS]
 
 
 def features_from_request_records(records: list[dict]) -> pd.DataFrame:
-    """Convert pre-aggregated API request records into a feature matrix."""
+    """Convert pre-aggregated API request records into the feature matrix."""
     rows = []
     for r in records:
-        total_dur = r["outgoing_duration"] + r["incoming_duration"]
+        og_dur = r["outgoing_duration"]
+        rec_dur = r.get("received_duration", 0)
+        og_calls = r["total_calls"]
+        rec_calls = r.get("received_calls", 0)
+        total_dur = og_dur + rec_dur
+        total_calls_all = og_calls + rec_calls
+
         rows.append({
             "MSISDN": r["msisdn"],
             "DATE": r["date"],
-            "outgoing_duration_1day": r["outgoing_duration"],
-            "incoming_duration_1day": r["incoming_duration"],
-            "outgoing_pct_1day": (r["outgoing_duration"] / total_dur * 100) if total_dur > 0 else 0,
-            "unique_recipients_1day": r["unique_recipients"],
-            "total_calls_1day": r["total_calls"],
-            "unique_cell_ids_1day": r["unique_cell_ids"],
-            "imei_count_1day": r["imei_count"],
-            "short_call_count_1day": r["short_call_count"],
-            "short_call_ratio_1day": (r["short_call_count"] / r["total_calls"]) if r["total_calls"] > 0 else 0,
-            "night_call_ratio_1day": r["night_call_ratio"],
-            "call_burst_ratio_1day": r["call_burst_ratio"],
-            "avg_call_gap_seconds_1day": r["avg_call_gap_seconds"],
-            "call_to_unique_ratio": r["total_calls"] / (r["unique_recipients"] + 1),
-            "duration_per_call": total_dur / r["total_calls"] if r["total_calls"] > 0 else 0,
-            "cell_id_density": r["unique_cell_ids"] / (r["total_calls"] + 1),
+            "outgoing_duration_1day":                  og_dur,
+            "avg_call_duration_1day":                  r.get("avg_call_duration", og_dur / og_calls if og_calls else 0),
+            "call_count_1day":                         og_calls,
+            "max_call_duration_1day":                  r.get("max_call_duration", 0),
+            "unique_recipients_1day":                  r["unique_recipients"],
+            "cell_diversity_1day":                     r["unique_cell_ids"],
+            "device_diversity_1day":                   r["imei_count"],
+            "short_calls_1day":                        r["short_call_count"],
+            "active_hours_1day":                       r.get("active_hours", 1),
+            "recipient_uniqueness_ratio":               r["unique_recipients"] / (og_calls + 1e-5),
+            "short_call_percent":                      r["short_call_count"] / (og_calls + 1e-5) * 100,
+            "calls_per_active_hour":                   og_calls / (r.get("active_hours", 1) + 1e-5),
+            "received_duration_within_dataset_1day":   rec_dur,
+            "received_calls_within_dataset_1day":      rec_calls,
+            "received_duration_percent_within_dataset": (rec_dur / total_dur * 100) if total_dur > 0 else 0,
+            "received_calls_percent_within_dataset":   (rec_calls / total_calls_all * 100) if total_calls_all > 0 else 0,
+            "call_to_unique_ratio":                    og_calls / (r["unique_recipients"] + 1),
+            "duration_to_calls_ratio":                 total_dur / (og_calls + 1),
+            "cell_diversity":                          r["unique_cell_ids"] / (og_calls + 1),
+            "received_outgoing_interaction":           rec_dur * og_dur,
+            "high_activity_flag":                      r.get("high_activity_flag", 0),
         })
     return pd.DataFrame(rows)
