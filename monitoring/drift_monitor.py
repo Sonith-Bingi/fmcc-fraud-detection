@@ -24,10 +24,10 @@ from app.features import FEATURE_COLS
 
 logger = logging.getLogger(__name__)
 
-POSTGRES_URL  = os.environ["POSTGRES_URL"]
+POSTGRES_URL  = os.getenv("POSTGRES_URL", "postgresql://fmcc:fmcc_secure_2025@172.31.18.63:5432/fmcc_fraud")
 SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN", "")
 AWS_REGION    = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-S3_BUCKET     = os.getenv("FMCC_S3_ARTIFACTS", "fmcc-artifacts")
+S3_BUCKET     = os.getenv("FMCC_S3_ARTIFACTS", "fmcc-fraud-results-635863384351")
 BASELINE_PATH = os.getenv("BASELINE_PATH", "baseline/training_features.parquet")
 
 
@@ -41,18 +41,9 @@ def load_baseline() -> pd.DataFrame:
 def load_current(run_date: date) -> pd.DataFrame:
     """Pull today's feature snapshot from the prediction log."""
     engine = create_engine(POSTGRES_URL)
-    query = f"""
-        SELECT msisdn, date,
-               fraud_probability,
-               -- join back to feature store would be ideal;
-               -- here we use logged probabilities as a proxy metric
-               fraud_probability AS outgoing_pct_1day
-        FROM prediction_log
-        WHERE date = '{run_date}'
-    """
-    # For a real deployment: read the day's parquet from S3 feature store instead.
-    # This fallback uses the prediction log for basic distribution checks.
-    df = pd.read_sql(query, engine)
+    query = f"SELECT fraud_probability FROM prediction_log WHERE date = '{run_date}'"
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn)
     return df
 
 
@@ -60,8 +51,10 @@ def load_current_from_s3(run_date: date) -> pd.DataFrame:
     s3 = boto3.client("s3", region_name=AWS_REGION)
     local = f"/tmp/fmcc_features_{run_date}.parquet"
     key = f"{run_date}/features.parquet"
-    s3.download_file("fmcc-features", key, local)
-    return pd.read_parquet(local)[FEATURE_COLS]
+    s3.download_file(S3_BUCKET, key, local)
+    df = pd.read_parquet(local)
+    shared = [c for c in FEATURE_COLS if c in df.columns]
+    return df[shared]
 
 
 def run_drift_report(run_date: Optional[date] = None) -> dict:
@@ -119,7 +112,6 @@ def run_drift_report(run_date: Optional[date] = None) -> dict:
     logger.info("Drift report uploaded to s3://%s/drift-reports/%s/report.html", S3_BUCKET, run_date)
 
     # ── Store per-feature drift in Postgres ───────────────────────────────────
-    engine = create_engine(POSTGRES_URL)
     rows = []
     for col_result in drift_metrics.get("drift_by_columns", {}).values():
         rows.append({
@@ -129,7 +121,9 @@ def run_drift_report(run_date: Optional[date] = None) -> dict:
             "drift_detected": col_result.get("drift_detected", False),
         })
     if rows:
-        pd.DataFrame(rows).to_sql("drift_report", engine, if_exists="append", index=False)
+        engine = create_engine(POSTGRES_URL)
+        with engine.connect() as conn:
+            pd.DataFrame(rows).to_sql("drift_report", conn, if_exists="append", index=False)
 
     # ── SNS alert ─────────────────────────────────────────────────────────────
     if drift_detected and SNS_TOPIC_ARN:

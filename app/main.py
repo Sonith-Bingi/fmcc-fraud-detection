@@ -18,6 +18,7 @@ from app.schemas import (
     PredictionResponse,
     PredictionResult,
 )
+from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -108,6 +109,26 @@ def predict(request: PredictionRequest):
         model_version=model_module.get_model_version(),
         threshold_used=threshold,
     )
+
+
+class ProcessRequest(BaseModel):
+    s3_key: str  # e.g. "cdrs/2025-07-01.csv"
+
+
+@app.post("/process", tags=["pipeline"])
+def process(request: ProcessRequest):
+    """
+    Full batch pipeline for one day's CDR file stored in S3.
+    Called by Lambda when a new CDR file lands in S3.
+    Reads CDRs → engineers features → scores fraud → writes to PostgreSQL.
+    """
+    from app.processor import process_s3_key
+    try:
+        summary = process_s3_key(request.s3_key)
+        return {"status": "ok", **summary}
+    except Exception as e:
+        logger.exception("Processing failed for %s", request.s3_key)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/", tags=["ops"])
